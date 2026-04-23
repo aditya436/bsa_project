@@ -1,0 +1,211 @@
+import pdfplumber
+import re
+import logging
+from datetime import datetime
+from typing import List
+from src.parsers.base_parser import BaseParser
+from src.models.transaction import Transaction
+
+# Set up logging for validation warnings
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
+
+class PDFParser(BaseParser):
+    def parse(self, file_path: str) -> List[Transaction]:
+        transactions = []
+        previous_balance = None
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                lines = text.split('\n')
+                i = 0
+                while i < len(lines):
+                    line = lines[i].strip()
+                    if re.match(r'\d{2}/\d{2}/\d{2}', line):
+                        # Start of transaction
+                        date = line[:8]
+                        content = line[8:].strip()
+                        i += 1
+                        # Collect continuation lines until next date
+                        while i < len(lines) and not re.match(r'\d{2}/\d{2}/\d{2}', lines[i].strip()):
+                            content += ' ' + lines[i].strip()
+                            i += 1
+                        # Parse the content
+                        parts = content.split()
+                        if len(parts) >= 4:
+                            # Find the value_dt (date)
+                            value_dt_idx = None
+                            for j, p in enumerate(parts):
+                                if re.match(r'\d{2}/\d{2}/\d{2}', p):
+                                    value_dt_idx = j
+                                    break
+                            if value_dt_idx is not None and value_dt_idx > 0:
+                                value_dt = parts[value_dt_idx]
+                                chq_ref_no = parts[value_dt_idx - 1]
+                                narration = ' '.join(parts[:value_dt_idx - 1])
+                                # Find amounts after value_dt
+                                remaining = parts[value_dt_idx + 1:]
+                                numbers = [p for p in remaining if re.match(r'\d+,\d+\.\d+|\d+\.\d+', p)]
+                                if len(numbers) >= 2:
+                                    first_amt = numbers[0]
+                                    closing_balance = numbers[1]
+                                    
+                                    # Validation 1: Ensure closing_balance is a valid number
+                                    try:
+                                        current_bal = float(closing_balance.replace(',', ''))
+                                    except ValueError:
+                                        logging.warning(f"Invalid closing balance '{closing_balance}' for transaction on {date}. Skipping.")
+                                        continue
+                                    
+                                    # Validation 2: Check for negative balances if unexpected (assuming savings account)
+                                    if current_bal < 0:
+                                        logging.warning(f"Negative closing balance {current_bal} detected for transaction on {date}.")
+                                    
+                                    # Balance-based logic with validation
+                                    if previous_balance is not None:
+                                        try:
+                                            prev_bal = float(previous_balance.replace(',', ''))
+                                        except ValueError:
+                                            logging.warning(f"Invalid previous balance '{previous_balance}'. Using keyword-based for {date}.")
+                                            prev_bal = None
+                                        
+                                        if prev_bal is not None:
+                                            amount = current_bal - prev_bal
+                                            if amount > 0:
+                                                deposit_amt = f"{amount:.2f}"
+                                                withdrawal_amt = ''
+                                            else:
+                                                withdrawal_amt = f"{-amount:.2f}"
+                                                deposit_amt = ''
+                                            
+                                            # Validation 3: Cross-check calculated amount with extracted first_amt
+                                            calculated_amt = abs(amount)
+                                            extracted_amt = float(first_amt.replace(',', ''))
+                                            if abs(calculated_amt - extracted_amt) > 0.01:  # Allow small floating point differences
+                                                logging.warning(f"Amount mismatch for {date}: calculated {calculated_amt:.2f}, extracted {extracted_amt:.2f}. Possible tampering.")
+                                        else:
+                                            # Fallback to keyword-based
+                                            if any(word in narration.upper() for word in ['DEPOSIT', 'CREDIT', 'RECEIVED', 'TRANSFER IN']):
+                                                withdrawal_amt = ''
+                                                deposit_amt = first_amt
+                                            else:
+                                                withdrawal_amt = first_amt
+                                                deposit_amt = ''
+                                    else:
+                                        # For first transaction, use keyword-based
+                                        if any(word in narration.upper() for word in ['DEPOSIT', 'CREDIT', 'RECEIVED', 'TRANSFER IN']):
+                                            withdrawal_amt = ''
+                                            deposit_amt = first_amt
+                                        else:
+                                            withdrawal_amt = first_amt
+                                            deposit_amt = ''
+                                    
+                                    # Validation 4: Ensure dates are in chronological order (convert to datetime for proper comparison)
+                                    if transactions:
+                                        try:
+                                            current_dt = datetime.strptime(date, '%d/%m/%y')
+                                            prev_dt = datetime.strptime(transactions[-1].date, '%d/%m/%y')
+                                            if current_dt < prev_dt:
+                                                logging.warning(f"Transaction date {date} is not in chronological order.")
+                                        except ValueError:
+                                            logging.warning(f"Invalid date format for {date} or {transactions[-1].date}.")
+                                    
+                                    transactions.append(Transaction(
+                                        date=date,
+                                        narration=narration,
+                                        chq_ref_no=chq_ref_no,
+                                        value_dt=value_dt,
+                                        withdrawal_amt=withdrawal_amt,
+                                        deposit_amt=deposit_amt,
+                                        closing_balance=closing_balance
+                                    ))
+                                    previous_balance = closing_balance
+                    else:
+                        i += 1
+        return transactions
+
+    def parse_metadata(self, file_path: str) -> dict:
+        with pdfplumber.open(file_path) as pdf:
+            first_page_text = pdf.pages[0].extract_text()
+            last_page_text = pdf.pages[-1].extract_text()
+
+        metadata = self._extract_header_metadata(first_page_text)
+        summary = self._extract_statement_summary(last_page_text)
+        metadata.update(summary)
+        return metadata
+
+    def _extract_header_metadata(self, text: str) -> dict:
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        data = {
+            'Name': '',
+            'Address': '',
+            'Joint Holder': '',
+            'Account Status': '',
+            'Email': '',
+            'IFSC code': '',
+            'A/C open date': '',
+            'From date': '',
+            'To date': ''
+        }
+
+        address_start = next((i for i, l in enumerate(lines) if l.startswith('Address')), None)
+        city_index = next((i for i, l in enumerate(lines) if l.startswith('City')), None)
+        if address_start is not None and city_index is not None and city_index > address_start:
+            address_lines = [lines[address_start].split(':', 1)[1].strip()]
+            address_lines += [lines[j] for j in range(address_start + 1, city_index)]
+            data['Address'] = ' '.join(address_lines).replace(' ,', ',')
+
+        if city_index is not None and city_index + 1 < len(lines):
+            data['Name'] = lines[city_index + 1]
+
+        joint_match = re.search(r'JOINTHOLDERS:\s*(.*?)\s*AccountStatus\s*:\s*(\S+)', text)
+        if joint_match:
+            data['Joint Holder'] = joint_match.group(1).strip()
+            data['Account Status'] = joint_match.group(2).strip()
+        else:
+            account_status_match = re.search(r'AccountStatus\s*:\s*(\S+)', text)
+            if account_status_match:
+                data['Account Status'] = account_status_match.group(1).strip()
+
+        email_match = re.search(r'Email\s*:\s*(\S+)', text)
+        if email_match:
+            data['Email'] = email_match.group(1).strip()
+
+        ifsc_match = re.search(r'RTGS/NEFTIFSC\s*:\s*(\S+)', text)
+        if ifsc_match:
+            data['IFSC code'] = ifsc_match.group(1).strip()
+
+        account_open_match = re.search(r'A/COpenDate\s*:\s*(\d{2}/\d{2}/\d{4})', text)
+        if account_open_match:
+            data['A/C open date'] = account_open_match.group(1).strip()
+
+        period_match = re.search(r'From\s*:\s*(\d{2}/\d{2}/\d{4})\s*To\s*:\s*(\d{2}/\d{2}/\d{4})', text)
+        if period_match:
+            data['From date'] = period_match.group(1).strip()
+            data['To date'] = period_match.group(2).strip()
+
+        return data
+
+    def _extract_statement_summary(self, text: str) -> dict:
+        data = {
+            'Opening Balance': '',
+            'Debit counts': '',
+            'Credit counts': '',
+            'Debit amount': '',
+            'Credit amount': '',
+            'Closing balance': ''
+        }
+        summary_start = re.search(r'STATEMENTSUMMARY', text)
+        if summary_start:
+            lines = [line.strip() for line in text[summary_start.end():].split('\n') if line.strip()]
+            header_index = next((i for i, line in enumerate(lines) if 'OpeningBalance' in line and 'ClosingBal' in line), None)
+            if header_index is not None and header_index + 1 < len(lines):
+                values_line = lines[header_index + 1]
+                numbers = re.findall(r'\d{1,3}(?:,\d{3})*(?:\.\d+)?', values_line)
+                if len(numbers) >= 6:
+                    data['Opening Balance'] = numbers[0]
+                    data['Debit counts'] = numbers[1]
+                    data['Credit counts'] = numbers[2]
+                    data['Debit amount'] = numbers[3]
+                    data['Credit amount'] = numbers[4]
+                    data['Closing balance'] = numbers[5]
+        return data
