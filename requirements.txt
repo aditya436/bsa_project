@@ -1,2 +1,5 @@
 pdfplumber
 pandas
+PyMuPDF
+pypdf
+jupyter
