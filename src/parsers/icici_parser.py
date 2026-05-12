@@ -149,127 +149,163 @@ class ICICIParser(BaseParser):
 
     def _parse_web_format(self, page_texts: List[str]) -> List[Transaction]:
         """
-        Parse web statement format: S No. Value Date Transaction Date Cheque Number Transaction Remarks Withdrawal Amount Deposit Amount Balance
+        Parse web statement format: S No. Value Date Transaction Date Cheque Number
+        Transaction Remarks Withdrawal Amount Deposit Amount Balance
         """
         transactions = []
 
+        # Collect all lines from all pages after the header is found
+        all_lines = []
+        header_found = False
         for page_text in page_texts:
             if not page_text:
                 continue
-
-            lines = page_text.split('\n')
-
-            # Find the header line
-            header_found = False
-            for line in lines:
-                if 'Value Date Transaction Date' in line and 'Withdrawal Amount' in line:
+            for line in page_text.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                # Detect and skip header line (only needs to appear once)
+                if 'Value Date Transaction Date' in line:
                     header_found = True
-                    break
+                    continue
+                # Skip lines before header (metadata)
+                if not header_found:
+                    continue
+                all_lines.append(line)
 
-            if not header_found:
+        if not all_lines:
+            return transactions
+
+        # Phase 1: Clean lines - strip serial numbers and skip artifacts
+        cleaned_lines = []
+        for line in all_lines:
+            # Skip lines that are purely digits (serial numbers or artifacts)
+            if re.match(r'^\d+$', line):
+                continue
+            # Skip sub-header lines like "(INR ) (INR )"
+            if re.match(r'^[\(\)INR\s]+$', line, re.IGNORECASE):
                 continue
 
-            # Process transaction lines after header
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
+            # Strip leading serial number if followed by a date
+            sno_date_match = re.match(r'^\d+\s+(\d{2}/\d{2}/\d{4})', line)
+            if sno_date_match:
+                cleaned_lines.append(line[sno_date_match.start(1):])
+                continue
 
-                # Skip header and empty lines
-                if not line or 'Value Date Transaction Date' in line or 'S No.' in line:
-                    i += 1
-                    continue
+            # Line starts directly with a date
+            if re.match(r'\d{2}/\d{2}/\d{4}', line):
+                cleaned_lines.append(line)
+                continue
 
-                # Check if this line starts with a date (potential transaction line)
-                if re.match(r'\d{2}/\d{2}/\d{4}', line):
-                    # Try to parse this as a complete transaction line
-                    transaction = self._parse_transaction_line_web(line)
-                    if transaction:
-                        transactions.append(transaction)
-                    else:
-                        # If parsing failed, it might be a continuation or malformed line
-                        # Try to combine with next few lines
-                        combined_line = line
-                        j = 1
-                        while i + j < len(lines) and j <= 3:  # Try up to 3 additional lines
-                            next_line = lines[i + j].strip()
-                            if re.match(r'\d{2}/\d{2}/\d{4}', next_line):
-                                # Next line starts a new transaction, stop here
-                                break
-                            combined_line += ' ' + next_line
-                            transaction = self._parse_transaction_line_web(combined_line)
-                            if transaction:
-                                transactions.append(transaction)
-                                i += j  # Skip the lines we consumed
-                                break
-                            j += 1
+            # Continuation line - strip leading serial number + space if present
+            sno_cont_match = re.match(r'^(\d+)\s+(\D)', line)
+            if sno_cont_match:
+                cleaned_lines.append(line[sno_cont_match.start(2):])
+            else:
+                cleaned_lines.append(line)
 
-                i += 1
+        # Phase 2: Group lines into transaction blocks
+        # Each block starts with a line beginning with DD/MM/YYYY
+        blocks = []
+        current_block = None
+
+        for line in cleaned_lines:
+            if re.match(r'\d{2}/\d{2}/\d{4}', line):
+                if current_block is not None:
+                    blocks.append(current_block)
+                current_block = [line]
+            else:
+                if current_block is not None:
+                    current_block.append(line)
+
+        if current_block is not None:
+            blocks.append(current_block)
+
+        # Phase 3: Parse each transaction block
+        for block in blocks:
+            main_line = block[0]
+            continuation = ' '.join(block[1:]) if len(block) > 1 else ''
+            transaction = self._parse_transaction_line_web(main_line, continuation)
+            if transaction:
+                transactions.append(transaction)
+            else:
+                logging.debug(f"Failed to parse web transaction: {main_line}")
 
         logging.info(f"Parsed {len(transactions)} transactions from ICICI web format")
         return transactions
 
-    def _parse_transaction_line_web(self, line: str) -> Transaction:
+    def _parse_transaction_line_web(self, line: str, continuation: str = '') -> Transaction:
         """
         Parse a single transaction line from web format.
 
-        Format: Value Date Transaction Date Cheque Number Transaction Remarks Withdrawal Amount Deposit Amount Balance
+        Format: Value Date Transaction Date - Transaction Remarks Withdrawal Amount Deposit Amount Balance
         Example: 01/07/2023 01/07/2023 - APY_501209797952_Rs.1318 fr 1318.00 0.0 100716.14
         """
         try:
-            # Find all decimal amounts in the line (withdrawal, deposit, balance)
-            amount_pattern = r'\d+\.\d+'
-            amounts = re.findall(amount_pattern, line)
+            # Match 3 amounts at the end of the line: WITHDRAWAL DEPOSIT BALANCE
+            # Amounts can be negative (e.g. balance), may have commas, variable decimal places
+            amount_end_pattern = r'(-?\d+(?:,\d{3})*\.\d+)\s+(-?\d+(?:,\d{3})*\.\d+)\s+(-?\d+(?:,\d{3})*\.\d+)\s*$'
+            match = re.search(amount_end_pattern, line)
 
-            if len(amounts) < 3:
-                return None  # Need at least withdrawal, deposit, balance
+            if not match:
+                return None
 
-            # The last 3 amounts should be withdrawal, deposit, balance
-            withdrawal_amt = amounts[-3]
-            deposit_amt = amounts[-2]
-            balance = amounts[-1]
+            withdrawal_raw = match.group(1)
+            deposit_raw = match.group(2)
+            balance_raw = match.group(3)
 
-            # Remove the amounts from the line to get the text part
-            text_part = re.sub(amount_pattern, '', line).strip()
+            # Extract text before the amounts
+            text_part = line[:match.start()].strip()
 
-            # Split the text part by dates
-            date_pattern = r'\d{2}/\d{2}/\d{4}'
-            dates = re.findall(date_pattern, text_part)
-
+            # Extract dates from text
+            dates = re.findall(r'\d{2}/\d{2}/\d{4}', text_part)
             if len(dates) < 2:
-                return None  # Need at least value date and transaction date
+                return None
 
             value_date = dates[0]
             transaction_date = dates[1]
 
-            # Remove dates from text part
-            text_without_dates = re.sub(date_pattern, '', text_part).strip()
+            # Extract remarks: remove dates and leading separator
+            remarks_text = re.sub(r'\d{2}/\d{2}/\d{4}', '', text_part).strip()
+            remarks_text = re.sub(r'^-\s*', '', remarks_text).strip()
 
-            # The remaining text should be: Cheque Number Transaction Remarks
-            # Cheque number is usually '-' or empty, then remarks
-            parts = text_without_dates.split()
-            cheque_number = parts[0] if parts and parts[0] != '-' else ''
-            remarks = ' '.join(parts[1:] if len(parts) > 1 else parts).strip()
+            # Append continuation narration
+            if continuation:
+                remarks_text = (remarks_text + ' ' + continuation).strip()
+
+            # Clean extra whitespace
+            remarks_text = re.sub(r'\s+', ' ', remarks_text).strip()
 
             # Normalize dates
             transaction_date = DateUtils.normalize_date(transaction_date)
             value_date = DateUtils.normalize_date(value_date)
 
             # Clean amounts
-            withdrawal_amt = withdrawal_amt if withdrawal_amt != '0.0' else ''
-            deposit_amt = deposit_amt if deposit_amt != '0.0' else ''
-            balance = balance.replace(',', '') if balance else ''
+            withdrawal_amt = withdrawal_raw.replace(',', '')
+            deposit_amt = deposit_raw.replace(',', '')
+            balance = balance_raw.replace(',', '')
 
-            # Extract cheque reference from remarks if not provided
-            chq_ref_no = cheque_number if cheque_number and cheque_number != '-' else ''
-            if not chq_ref_no and '/' in remarks:
-                # Extract reference from patterns like UPI/318280289099/
-                ref_match = re.search(r'/([A-Za-z0-9]+)/', remarks)
-                if ref_match:
-                    chq_ref_no = ref_match.group(1)
+            # Mark zero amounts as empty (no withdrawal/deposit)
+            try:
+                if float(withdrawal_amt) == 0:
+                    withdrawal_amt = ''
+            except ValueError:
+                pass
+            try:
+                if float(deposit_amt) == 0:
+                    deposit_amt = ''
+            except ValueError:
+                pass
+
+            # Extract cheque/reference number from remarks
+            chq_ref_no = ''
+            ref_match = re.search(r'/(\d{5,})/', remarks_text)
+            if ref_match:
+                chq_ref_no = ref_match.group(1)
 
             return Transaction(
                 date=transaction_date,
-                narration=remarks,
+                narration=remarks_text,
                 chq_ref_no=chq_ref_no,
                 value_dt=value_date,
                 withdrawal_amt=withdrawal_amt,
@@ -386,110 +422,6 @@ class ICICIParser(BaseParser):
             deposit_amt=deposit_amt,
             closing_balance=closing_balance
         ), transaction_amount
-        """
-        Parse a complete transaction block that may span multiple lines.
-        
-        Expected format:
-        DD-MM-YYYY MODE/.../PARTICULARS AMOUNT BALANCE
-        [continuation lines for particulars]
-        """
-        if not lines:
-            return None
-            
-        # First line contains the main transaction data
-        first_line = lines[0]
-        
-        # Extract date (first part)
-        date_match = re.match(r'(\d{2}-\d{2}-\d{4})', first_line)
-        if not date_match:
-            return None
-            
-        date = date_match.group(1)
-        # Normalize date to ensure consistent dd-mm-yyyy format
-        date = DateUtils.normalize_date(date)
-        remaining = first_line[len(date):].strip()
-        
-        # Find all amounts in the transaction (last one is balance)
-        amounts = re.findall(r'\d{1,3}(?:,\d{3})*\.\d{2}', first_line)
-        
-        if not amounts:
-            logging.warning(f"No amounts found in transaction line: {first_line}")
-            return None
-            
-        # Last amount is always the balance
-        closing_balance = amounts[-1]
-        
-        # Transaction amount is the second-to-last amount (if exists)
-        transaction_amount = amounts[-2] if len(amounts) >= 2 else ''
-        
-        # Extract mode and particulars
-        # Split remaining text into parts
-        parts = remaining.split()
-        
-        # Find where amounts start to separate text from numbers
-        amount_start_idx = -1
-        for j, part in enumerate(parts):
-            if re.match(r'\d{1,3}(?:,\d{3})*\.\d{2}', part):
-                amount_start_idx = j
-                break
-        
-        if amount_start_idx == -1:
-            # No amounts found in parts, this shouldn't happen
-            return None
-        
-        # Text parts are everything before the first amount
-        text_parts = parts[:amount_start_idx]
-        
-        # Join all text parts and then parse mode/particulars
-        full_text = ' '.join(text_parts)
-        
-        # Mode is the first part before slash
-        if '/' in full_text:
-            mode_part, particulars = full_text.split('/', 1)
-            mode = mode_part.strip()
-            particulars = particulars.strip()
-        else:
-            # No slash, assume first word is mode
-            words = full_text.split()
-            mode = words[0] if words else ''
-            particulars = ' '.join(words[1:]) if len(words) > 1 else ''
-        
-        # Add continuation lines to particulars
-        if len(lines) > 1:
-            continuation = ' '.join(lines[1:]).strip()
-            if continuation:
-                particulars += ' ' + continuation
-        
-        # Clean up particulars (remove extra spaces)
-        particulars = re.sub(r'\s+', ' ', particulars).strip()
-        
-        # Determine debit/credit based on mode and balance change
-        withdrawal_amt = ''
-        deposit_amt = ''
-        
-        # Note: Debit/credit determination will be done in main parse method using balance changes
-        # For now, just store the transaction amount for validation
-        
-        # Use current date as value_dt since ICICI doesn't have separate value date
-        value_dt = date
-        
-        # For ICICI, chq_ref_no might be part of mode or empty
-        chq_ref_no = ''
-        if '/' in mode:
-            # Extract reference number from mode like "CRED/6305480595@axis"
-            mode_parts = mode.split('/')
-            if len(mode_parts) > 1:
-                chq_ref_no = mode_parts[1].split('@')[0]  # Take the number part
-        
-        return Transaction(
-            date=date,
-            narration=particulars,
-            chq_ref_no=chq_ref_no,
-            value_dt=value_dt,
-            withdrawal_amt=withdrawal_amt,
-            deposit_amt=deposit_amt,
-            closing_balance=closing_balance
-        ), transaction_amount
 
     def parse_metadata(self, file_path: str) -> Dict[str, str]:
         """
@@ -500,6 +432,8 @@ class ICICIParser(BaseParser):
         - Statement period dates
         - Branch information
         - Contact details
+        
+        Supports both web format and traditional format.
         """
         metadata = {
             'Bank': 'ICICI',
@@ -520,55 +454,96 @@ class ICICIParser(BaseParser):
                 logging.error(f"Could not extract text from {file_path} for metadata")
                 return metadata
             
-            # Check first few pages for metadata
-            for page_text in page_texts[:3]:  # Check first 3 pages
-                if not page_text:
+            # Combine first few pages for metadata search
+            header_text = '\n'.join(page_texts[:3])
+            lines = header_text.split('\n')
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
                     continue
-                    
-                lines = page_text.split('\n')
                 
-                # Look for account number pattern
-                for line in lines:
-                    line = line.strip()
-                    
-                    # Account number patterns
-                    acct_match = re.search(r'Account\s+(?:Number|No\.?)\s*:\s*(\d+)', line, re.IGNORECASE)
-                    if not acct_match:
-                        acct_match = re.search(r'Savings\s+Account\s+(?:Number|No\.?)\s*:\s*(\d+)', line, re.IGNORECASE)
+                # --- Account Number ---
+                if not metadata['Account Number']:
+                    # Web format: "Account Number 036001534567(INR) - RAJKUMAR GOVIND"
+                    acct_match = re.search(r'Account\s+Number\s+(\d+)\s*\(INR\)\s*-\s*(.+)', line, re.IGNORECASE)
                     if acct_match:
                         metadata['Account Number'] = acct_match.group(1)
-                        
-                        # Account holder name
-                        if 'Statement of Transactions in Savings Account Number:' in line:
-                            # Name might be in next lines
-                            continue
-                        
-                        # Statement period
-                        period_match = re.search(r'for\s+the\s+period\s+from\s+(\d{2}-\d{2}-\d{4})\s+to\s+(\d{2}-\d{2}-\d{4})', line, re.IGNORECASE)
-                        if period_match:
-                            metadata['From date'] = period_match.group(1)
-                            metadata['To date'] = period_match.group(2)
-                        
-                        # Branch information
-                        branch_match = re.search(r'Branch\s*:\s*(.+?)(?:\s*IFSC|$)', line, re.IGNORECASE)
-                        if branch_match:
-                            metadata['Branch'] = branch_match.group(1).strip()
-                        
-                        # Email
-                        email_match = re.search(r'Email\s*:\s*([^\s]+@[^\s]+\.[^\s]+)', line, re.IGNORECASE)
-                        if email_match:
-                            metadata['Email'] = email_match.group(1)
-                        
-                        # Mobile
-                        mobile_match = re.search(r'Mobile\s*:\s*(\d+)', line, re.IGNORECASE)
-                        if mobile_match:
-                            metadata['Mobile'] = mobile_match.group(1)
-                    
-                    # Try to extract account holder name from header
-                    header_text = ' '.join(lines[:10])  # First 10 lines usually contain header
-                    name_match = re.search(r'Statement\s+of\s+Transactions\s+in\s+Savings\s+Account\s+Number:\s*\d+\s+in\s+INR\s+for\s+(.+?)\s+for\s+the\s+period', header_text, re.IGNORECASE)
+                        metadata['Account Holder'] = acct_match.group(2).strip()
+                    else:
+                        # Traditional format: "Account Number: 036001534567" or "Account No.: ..."
+                        acct_match = re.search(r'Account\s+(?:Number|No\.?)\s*:?\s*(\d{6,})', line, re.IGNORECASE)
+                        if not acct_match:
+                            acct_match = re.search(r'Savings\s+Account\s+(?:Number|No\.?)\s*:?\s*(\d{6,})', line, re.IGNORECASE)
+                        if acct_match:
+                            metadata['Account Number'] = acct_match.group(1)
+                
+                # --- Account Holder (additional patterns) ---
+                if not metadata['Account Holder']:
+                    # "Transactions List - RAJKUMAR GOVIND - 036001534567"
+                    name_match = re.search(r'Transactions\s+List\s*-\s*(.+?)\s*-\s*\d+', line, re.IGNORECASE)
                     if name_match:
                         metadata['Account Holder'] = name_match.group(1).strip()
+                    else:
+                        # Traditional: "MR.KARRAVULA PRAVEEN KUMAR Your Base Branch: ..."
+                        name_match = re.search(r'^((?:MR|MRS|MS|MISS|DR)\.?\s*.+?)\s+Your\s+Base\s+Branch', line, re.IGNORECASE)
+                        if name_match:
+                            metadata['Account Holder'] = name_match.group(1).strip()
+                
+                # --- Statement Period ---
+                if not metadata['From date'] or not metadata['To date']:
+                    # Web format: "Transaction Date from 01/07/2023 to 08/10/2023"
+                    period_match = re.search(
+                        r'(?:Transaction\s+Date|Date)\s+from\s+(\d{2}/\d{2}/\d{4})\s+to\s+(\d{2}/\d{2}/\d{4})',
+                        line, re.IGNORECASE
+                    )
+                    if period_match:
+                        metadata['From date'] = DateUtils.normalize_date(period_match.group(1))
+                        metadata['To date'] = DateUtils.normalize_date(period_match.group(2))
+                    else:
+                        # Traditional: "for the period from DD-MM-YYYY to DD-MM-YYYY"
+                        period_match = re.search(
+                            r'for\s+the\s+period\s+from\s+(\d{2}[-/]\d{2}[-/]\d{4})\s+to\s+(\d{2}[-/]\d{2}[-/]\d{4})',
+                            line, re.IGNORECASE
+                        )
+                        if period_match:
+                            metadata['From date'] = DateUtils.normalize_date(period_match.group(1))
+                            metadata['To date'] = DateUtils.normalize_date(period_match.group(2))
+                    
+                    # Traditional with English month names: "for the period August 31, 2023 - February 08, 2024"
+                    if not metadata['From date'] or not metadata['To date']:
+                        period_match = re.search(
+                            r'for\s+the\s+period\s+(\w+\s+\d{1,2},?\s+\d{4})\s*[-–]\s*(\w+\s+\d{1,2},?\s+\d{4})',
+                            line, re.IGNORECASE
+                        )
+                        if period_match:
+                            try:
+                                from_str = period_match.group(1).replace(',', '')
+                                to_str = period_match.group(2).replace(',', '')
+                                from_dt = datetime.strptime(from_str, '%B %d %Y')
+                                to_dt = datetime.strptime(to_str, '%B %d %Y')
+                                metadata['From date'] = from_dt.strftime('%d-%m-%Y')
+                                metadata['To date'] = to_dt.strftime('%d-%m-%Y')
+                            except ValueError:
+                                pass
+                
+                # --- Branch ---
+                if not metadata['Branch']:
+                    branch_match = re.search(r'(?:Your\s+Base\s+)?Branch\s*:\s*(.+?)(?:\s*IFSC|$)', line, re.IGNORECASE)
+                    if branch_match:
+                        metadata['Branch'] = branch_match.group(1).strip()
+                
+                # --- Email ---
+                if not metadata['Email']:
+                    email_match = re.search(r'Email\s*:?\s*([^\s]+@[^\s]+\.[^\s]+)', line, re.IGNORECASE)
+                    if email_match:
+                        metadata['Email'] = email_match.group(1)
+                
+                # --- Mobile ---
+                if not metadata['Mobile']:
+                    mobile_match = re.search(r'Mobile\s*:?\s*(\d{10,})', line, re.IGNORECASE)
+                    if mobile_match:
+                        metadata['Mobile'] = mobile_match.group(1)
         
         except Exception as e:
             logging.error(f"Error extracting ICICI metadata: {str(e)}")
@@ -594,7 +569,11 @@ class ICICIParser(BaseParser):
             # Check all pages for ICICI markers
             all_text = ' '.join(page_texts)
             
-            # Look for ICICI-specific markers
+            # Check for web format (ICICI online banking statement)
+            if 'S No. Value Date Transaction Date' in all_text:
+                return True
+            
+            # Check for traditional format markers (need at least 2)
             icici_markers = [
                 'ICICI Bank', 
                 'Statement of Transactions in Savings Account',
