@@ -19,6 +19,23 @@ class HDFCParser(BaseParser):
     Date, Narration, Chq/Ref No., Value Date, Withdrawal, Deposit, Closing Balance
     """
     
+    # Footer/boilerplate lines that appear at the bottom of every page
+    _FOOTER_MARKERS = (
+        'HDFCBANKLIMITED',
+        '*Closingbalance',
+        'Contentsofthisstatement',
+        'thisstatement.',
+        'StateaccountbranchGSTN',
+        'HDFCBankGSTINnumber',
+        'RegisteredOfficeAddress',
+        'PageNo.:',
+        'STATEMENTSUMMARY',
+        'OpeningBalance',
+        'GeneratedOn:',
+        'Thisisacomputergenerated',
+        'notrequiresignature.',
+    )
+
     def parse(self, file_path: str) -> List[Transaction]:
         """Parse HDFC statement PDF and extract transactions."""
         transactions = []
@@ -30,19 +47,29 @@ class HDFCParser(BaseParser):
                 i = 0
                 while i < len(lines):
                     line = lines[i].strip()
+                    # Skip page footer/boilerplate lines
+                    if any(line.startswith(marker) for marker in self._FOOTER_MARKERS):
+                        i += 1
+                        continue
                     if re.match(r'\d{2}/\d{2}/\d{2}', line):
                         # Start of transaction
                         date = line[:8]
                         # Normalize date to dd-mm-yyyy format
                         date = DateUtils.normalize_date(date)
-                        content = line[8:].strip()
+                        main_line = line[8:].strip()
                         i += 1
-                        # Collect continuation lines until next date
+                        # Collect continuation lines separately until next date
+                        continuation_parts = []
+                        footer_reached = False
                         while i < len(lines) and not re.match(r'\d{2}/\d{2}/\d{2}', lines[i].strip()):
-                            content += ' ' + lines[i].strip()
+                            stripped = lines[i].strip()
+                            if any(stripped.startswith(marker) for marker in self._FOOTER_MARKERS):
+                                footer_reached = True
+                            if stripped and not footer_reached:
+                                continuation_parts.append(stripped)
                             i += 1
-                        # Parse the content
-                        parts = content.split()
+                        # Parse the main line only for structured fields
+                        parts = main_line.split()
                         if len(parts) >= 4:
                             # Find the value_dt (date)
                             value_dt_idx = None
@@ -56,6 +83,9 @@ class HDFCParser(BaseParser):
                                 value_dt = DateUtils.normalize_date(value_dt)
                                 chq_ref_no = parts[value_dt_idx - 1]
                                 narration = ' '.join(parts[:value_dt_idx - 1])
+                                # Append continuation lines to narration
+                                if continuation_parts:
+                                    narration = (narration + ' ' + ' '.join(continuation_parts)).strip()
                                 # Find amounts after value_dt
                                 remaining = parts[value_dt_idx + 1:]
                                 numbers = [p for p in remaining if re.match(r'\d+,\d+\.\d+|\d+\.\d+', p)]
@@ -158,12 +188,18 @@ class HDFCParser(BaseParser):
         lines = [line.strip() for line in text.split('\n') if line.strip()]
         data = {
             'Bank': 'HDFC',
-            'Name': '',
+            'Account Holder': '',
+            'Account Number': '',
             'Address': '',
             'Joint Holder': '',
             'Account Status': '',
+            'Branch': '',
             'Email': '',
+            'Mobile': '',
             'IFSC code': '',
+            'PAN': '',
+            'Customer ID': '',
+            'Scheme': '',
             'A/C open date': '',
             'From date': '',
             'To date': ''
@@ -177,7 +213,7 @@ class HDFCParser(BaseParser):
             data['Address'] = ' '.join(address_lines).replace(' ,', ',')
 
         if city_index is not None and city_index + 1 < len(lines):
-            data['Name'] = lines[city_index + 1]
+            data['Account Holder'] = lines[city_index + 1]
 
         joint_match = re.search(r'JOINTHOLDERS:\s*(.*?)\s*AccountStatus\s*:\s*(\S+)', text)
         if joint_match:
@@ -195,6 +231,18 @@ class HDFCParser(BaseParser):
         ifsc_match = re.search(r'RTGS/NEFTIFSC\s*:\s*(\S+)', text)
         if ifsc_match:
             data['IFSC code'] = ifsc_match.group(1).strip()
+
+        acct_match = re.search(r'AccountNo\s*:\s*(\d+)', text)
+        if acct_match:
+            data['Account Number'] = acct_match.group(1).strip()
+
+        mobile_match = re.search(r'Phone(?:no\.?|\s+no\.?)\s*:\s*(\S+)', text, re.IGNORECASE)
+        if mobile_match:
+            data['Mobile'] = mobile_match.group(1).strip()
+
+        branch_match = re.search(r'AccountBranch\s*:\s*(.+)', text)
+        if branch_match:
+            data['Branch'] = branch_match.group(1).strip()
 
         account_open_match = re.search(r'A/COpenDate\s*:\s*(\d{2}/\d{2}/\d{4})', text)
         if account_open_match:
@@ -215,7 +263,7 @@ class HDFCParser(BaseParser):
             'Credit counts': '',
             'Debit amount': '',
             'Credit amount': '',
-            'Closing balance': ''
+            'Closing Balance': ''
         }
         summary_start = re.search(r'STATEMENTSUMMARY', text)
         if summary_start:
@@ -232,7 +280,7 @@ class HDFCParser(BaseParser):
                     if opening_match:
                         data['Opening Balance'] = opening_match.group(1)
                     if closing_match:
-                        data['Closing balance'] = closing_match.group(1)
+                        data['Closing Balance'] = closing_match.group(1)
             
             debits_match = re.search(r'DebitAdvices:(\d+)', text)
             credits_match = re.search(r'CreditAdvices:(\d+)', text)

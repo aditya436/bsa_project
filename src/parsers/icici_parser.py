@@ -437,14 +437,27 @@ class ICICIParser(BaseParser):
         """
         metadata = {
             'Bank': 'ICICI',
-            'Account Number': '',
             'Account Holder': '',
-            'From date': '',
-            'To date': '',
+            'Account Number': '',
+            'Address': '',
+            'Joint Holder': '',
+            'Account Status': '',
             'Branch': '',
             'Email': '',
             'Mobile': '',
-            'Account Status': ''
+            'IFSC code': '',
+            'PAN': '',
+            'Customer ID': '',
+            'Scheme': '',
+            'A/C open date': '',
+            'From date': '',
+            'To date': '',
+            'Opening Balance': '',
+            'Closing Balance': '',
+            'Debit counts': '',
+            'Credit counts': '',
+            'Debit amount': '',
+            'Credit amount': ''
         }
         
         try:
