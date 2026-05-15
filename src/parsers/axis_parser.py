@@ -265,10 +265,12 @@ class AxisParser(BaseParser):
             r'^(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s+'  # value_dt  txn_dt
             r'(-|[\w/]+)\s+'                                     # chq_no (often '-')
             r'(.+?)\s+'                                          # remarks
-            r'(\d{1,3}(?:,\d{3})*\.\d+)\s+'                     # withdrawal or deposit
-            r'(\d{1,3}(?:,\d{3})*\.\d+)\s+'                     # deposit or balance
-            r'(\d{1,3}(?:,\d{3})*\.\d+)$'                       # balance
+            r'(\d[\d,]*\.\d+)\s+'                               # withdrawal amount
+            r'(\d[\d,]*\.\d+)\s+'                               # deposit amount
+            r'(\d[\d,]*\.\d+)$'                                 # balance
         )
+        # Serial number line: pure integer OR integer followed by narration continuation
+        serial_re = re.compile(r'^\d+\s*(.*)')
 
         for page_text in page_texts:
             lines = [l.strip() for l in page_text.split('\n')]
@@ -279,7 +281,15 @@ class AxisParser(BaseParser):
                     i += 1
                     continue
 
-                m = row_re.match(line)
+                # Handle page-boundary artifact: serial from previous txn
+                # continuation prepended to next txn's date line
+                # e.g. '49 16/09/2023 16/09/2023 - UPI/...'
+                match_line = line
+                serial_prefix = re.match(r'^(\d+)\s+(\d{2}/\d{2}/\d{4}\s+\d{2}/\d{2}/\d{4}.+)', line)
+                if serial_prefix:
+                    match_line = serial_prefix.group(2)
+
+                m = row_re.match(match_line)
                 if m:
                     value_dt = DateUtils.normalize_date(m.group(1))
                     txn_dt = DateUtils.normalize_date(m.group(2))
@@ -295,17 +305,30 @@ class AxisParser(BaseParser):
                     closing_balance = amt3
 
                     i += 1
-                    # Skip serial number line (pure integer)
-                    if i < len(lines) and re.match(r'^\d+$', lines[i].strip()):
-                        i += 1
+                    # Next line is the serial number, optionally followed by
+                    # narration continuation on the same line (e.g. "1 Ph/shahid...")
+                    if i < len(lines):
+                        sm = serial_re.match(lines[i].strip())
+                        if sm:
+                            tail = sm.group(1).strip()
+                            if tail:
+                                narration = (narration + ' ' + tail).strip()
+                            i += 1
 
-                    # Collect continuation narration lines
+                    # Collect any further continuation narration lines
                     while i < len(lines):
                         nxt = lines[i].strip()
                         if not nxt or self._is_footer(nxt) or self._is_header(nxt):
                             break
-                        # Stop if next line is a new transaction row
-                        if row_re.match(nxt):
+                        # Stop if next line is a new transaction row (with or without serial prefix)
+                        check_nxt = nxt
+                        sp = re.match(r'^(\d+)\s+(\d{2}/\d{2}/\d{4}\s+\d{2}/\d{2}/\d{4}.+)', nxt)
+                        if sp:
+                            check_nxt = sp.group(2)
+                        if row_re.match(check_nxt):
+                            break
+                        # Stop if pure integer — it's the serial number of the next transaction
+                        if re.match(r'^\d+$', nxt):
                             break
                         narration = (narration + ' ' + nxt).strip()
                         i += 1
