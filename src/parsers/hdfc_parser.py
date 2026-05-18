@@ -246,12 +246,12 @@ class HDFCParser(BaseParser):
 
         account_open_match = re.search(r'A/COpenDate\s*:\s*(\d{2}/\d{2}/\d{4})', text)
         if account_open_match:
-            data['A/C open date'] = account_open_match.group(1).strip()
+            data['A/C open date'] = account_open_match.group(1).strip().replace('/', '-')
 
         period_match = re.search(r'From\s*:\s*(\d{2}/\d{2}/\d{4})\s*To\s*:\s*(\d{2}/\d{2}/\d{4})', text)
         if period_match:
-            data['From date'] = period_match.group(1).strip()
-            data['To date'] = period_match.group(2).strip()
+            data['From date'] = period_match.group(1).strip().replace('/', '-')
+            data['To date']   = period_match.group(2).strip().replace('/', '-')
 
         return data
 

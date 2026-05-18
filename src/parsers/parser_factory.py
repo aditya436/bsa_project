@@ -4,6 +4,7 @@ from src.parsers.base_parser import BaseParser
 from src.parsers.hdfc_parser import HDFCParser
 from src.parsers.icici_parser import ICICIParser
 from src.parsers.axis_parser import AxisParser
+from src.parsers.sbi_parser import SBIParser
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
@@ -22,6 +23,7 @@ class ParserFactory:
         'hdfc': HDFCParser,
         'icici': ICICIParser,
         'axis': AxisParser,
+        'sbi':  SBIParser,
     }
     
     @staticmethod
